@@ -1,6 +1,7 @@
 import os  
 import sys
 from collections import defaultdict
+import ast
 
 import pandas as pd
 import numpy as np
@@ -8,6 +9,14 @@ import networkx as nx
 import recordlinkage
 import textdistance
 from recordlinkage.base import BaseCompareFeature
+import requests
+import time
+import pycountry
+from rapidfuzz import fuzz
+import geopandas
+import geopy
+import neo4j
+import cleanco
 
 # Load NLP model
 import spacy
@@ -29,11 +38,35 @@ from src.functions import (
     df_expand_abbreviations,
     df_lemmatize_columns_spacy
 )
-#from src.mongo import fetch_meta, fetch_nodes_and_rels
+
+def apply_and_log(df, func, func_name, subset_cols):
+    '''Collects meta information about how many changes are caused by each cleaning function'''
+    df, counts = func(df.copy(), subset_cols)
+    counts['function'] = func_name
+    change_log.append(counts)
+    return df
+
+def wrap_in_list(val):
+    # Case 1: already a list → return as-is
+    if isinstance(val, list):
+        return val
+    
+    # Case 2: string that looks like a list → safely convert it
+    if isinstance(val, str):
+        try:
+            parsed = ast.literal_eval(val)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass  # not a list-looking string
+
+        return [val.strip()]  # fallback: wrap single string
+
+    # Case 3: NaN or None
+    return []
 
 # ----------------------------
-# Custom list-string matcher - 
-# this compares two columns of lists of strings, and returns 1 if any string in one list sufficiently matches any string in the other list
+# Custom list-string matcher -  this compares two columns of lists of strings, and returns 1 if any string in one list sufficiently matches any string in the other list
 # ----------------------------
 class CompareAnyStringListMatch(BaseCompareFeature):
     def __init__(self, left_on, right_on=None, threshold=0.80, method='jarowinkler', label=None):
@@ -97,15 +130,9 @@ class CompareAnyStringListMatch(BaseCompareFeature):
 
 file_path = "reconciliation_outputs_factory.xlsx"
 df1 = pd.read_excel(file_path, sheet_name="factory")
+df1 = df1.head(50)
 subset_cols = ["factory_name", "factory_country", "factory_city", "owner_company_name", "product_name"]
 change_log = []
-
-def apply_and_log(df, func, func_name, subset_cols):
-    '''Collects meta information about how many changes are caused by each cleaning function'''
-    df, counts = func(df.copy(), subset_cols)
-    counts['function'] = func_name
-    change_log.append(counts)
-    return df
 
 # Apply cleaning
 for func, name in [
@@ -121,31 +148,9 @@ print("\nChange Count Table:")
 print(pd.DataFrame(change_log).set_index("function").fillna(0).astype(int))
 
 # ----------------------------
-# Wrap cleaned strings into lists for matching
+# Wrap cleaned strings into lists for matching (only for specific fields that may contain multiple values)
 # ----------------------------
-import ast
 
-def wrap_in_list(val):
-    # Case 1: already a list → return as-is
-    if isinstance(val, list):
-        return val
-    
-    # Case 2: string that looks like a list → safely convert it
-    if isinstance(val, str):
-        try:
-            parsed = ast.literal_eval(val)
-            if isinstance(parsed, list):
-                return parsed
-        except Exception:
-            pass  # not a list-looking string
-
-        return [val.strip()]  # fallback: wrap single string
-
-    # Case 3: NaN or None
-    return []
-
-
-# Only wrap these specific fields that may contain multiple values
 cols_to_wrap = ['owner_company_name', 'product_name']
 for col in cols_to_wrap:
     df1[col] = df1[col].apply(wrap_in_list)
@@ -154,78 +159,11 @@ for col in cols_to_wrap:
 df1['product_name'] = df1['product_name'].astype(object)
 df1['owner_company_name'] = df1['owner_company_name'].astype(object)
 
-
-
-# ----------------------------
-# Blocking - we only allow comparison for entries that are in the same country
-# ----------------------------
-indexer = recordlinkage.Index()
-indexer.block('factory_country')
-
-candidate_links = indexer.index(df1)
-
-# ----------------------------
-# Compare
-# ----------------------------
-compare = recordlinkage.Compare() #initialises a comparison engine
-compare.exact('factory_country', 'factory_country', label='country') 
-compare.exact('factory_city', 'factory_city', label='city')
-compare.string('factory_name', 'factory_name', label='name')
-
-compare.add(CompareAnyStringListMatch('product_name', 'product_name', threshold=0.80, method='jarowinkler', label='product'))
-compare.add(CompareAnyStringListMatch('owner_company_name', 'owner_company_name', threshold=0.80, method='jarowinkler', label='owner'))
-
-features = compare.compute(candidate_links, df1)
-
-# ----------------------------
-# Match Logic
-# ----------------------------
-matches = features[
-    (features['country'] == 1) &
-    (features['city'] == 1) &
-    (
-        (features['name'] == 1) |
-        (features['owner'] == 1) |
-        (features['product'] == 1)
-    )
-]
-
-match_pairs = matches.index.tolist()
-print("Matched Pairs:", match_pairs)
-
-
-# ----------------------------
-# Grouping
-# ----------------------------
-G = nx.Graph()
-G.add_edges_from(match_pairs)
-record_to_group = {record: group_id for group_id, component in enumerate(nx.connected_components(G)) for record in component}
-
-# ----------------------------
-# Annotate Output
-# ----------------------------
-df1['group_id'] = -1
-df1['is_duplicate'] = False
-
-for record_idx, group_id in record_to_group.items():
-    df1.at[record_idx, 'group_id'] = group_id
-    df1.at[record_idx, 'is_duplicate'] = True
-
-
-# ----------------------------
-# Save Output
-# ----------------------------
-df1.to_excel("full_step1.xlsx", index=False)
-df1 = df1.rename(columns={"is_duplicate": "is_duplicate_step1", "group_id": "group_id_step1"})
-df1[df1['is_duplicate_step1']].to_excel("is_duplicate_step1.xlsx", index=False)
-df1[~df1['is_duplicate_step1']].to_excel("is_not_duplicate_step1.xlsx", index=False)
-
 # Step 2 -------------------------------------------------------
 
 pattern = r"[.,;!?]"
 
-# Apply normalization steps with logging
-# # Company and product-specific cleaning
+# Company and product-specific cleaning
 subset_cols= ["owner_company_name"]
 df1 = apply_and_log(df1, df_clean_company , "cleanCompany", subset_cols)
 # Apply normalization steps with logging
@@ -234,176 +172,22 @@ df1 = apply_and_log(df1, df_remove_punctuation , "ponctuation", subset_cols)
 df1 = apply_and_log(df1, df_replace_hyphen_with_space, "hyphen", subset_cols)
 df1 = apply_and_log(df1, df_expand_symbols, "symbol", subset_cols)
 
-# ----------------------------
-# Blocking
-# ----------------------------
-indexer = recordlinkage.Index()
-indexer.block('factory_country')
-
-candidate_links = indexer.index(df1)
-
-# ----------------------------
-# Compare
-# ----------------------------
-compare = recordlinkage.Compare()
-compare.exact('factory_country', 'factory_country', label='country')
-compare.exact('factory_city', 'factory_city', label='city')
-compare.string('factory_name', 'factory_name', label='name')
-
-compare.add(CompareAnyStringListMatch('product_name', 'product_name', threshold=0.80, method='jarowinkler', label='product'))
-compare.add(CompareAnyStringListMatch('owner_company_name', 'owner_company_name', threshold=0.80, method='jarowinkler', label='owner'))
-
-features = compare.compute(candidate_links, df1)
-
-# ----------------------------
-# Match Logic
-# ----------------------------
-matches = features[
-    (features['country'] == 1) &
-    (features['city'] == 1) &
-    (
-        (features['name'] == 1) |
-        (features['owner'] == 1) |
-        (features['product'] == 1)
-    )
-]
-
-match_pairs = matches.index.tolist()
-print("Matched Pairs:", match_pairs)
-
-
-# ----------------------------
-# Grouping
-# ----------------------------
-G = nx.Graph()
-G.add_edges_from(match_pairs)
-record_to_group = {record: group_id for group_id, component in enumerate(nx.connected_components(G)) for record in component}
-
-# ----------------------------
-# Annotate Output
-# ----------------------------
-df1['group_id'] = -1
-df1['is_duplicate'] = False
-
-for record_idx, group_id in record_to_group.items():
-    df1.at[record_idx, 'group_id'] = group_id
-    df1.at[record_idx, 'is_duplicate'] = True
-
-
-# ----------------------------
-# 8. Display Results
-# ----------------------------
-
-# Save to file if needed
-
-df1 = df1.rename(columns={"is_duplicate": "is_duplicate_step2", "group_id": "group_id_step2"})
-df1.to_excel("full_step2.xlsx", index=False)
-df4 = df1[df1['is_duplicate_step2'] == True].copy()
-df5 = df1[df1['is_duplicate_step2'] == False].copy()
-
-
-df4.to_excel("is_duplicate_step2.xlsx", index=False)
-df5.to_excel("is_not_duplicate_step2.xlsx", index=False)
-
-
-# # # STEP 3 ------------------------------------------------
+# STEP 3 ------------------------------------------------
 subset_cols= ["product_name"]
 df1 = apply_and_log(df1, df_expand_abbreviations, "productAbbrevation",["product_name"])
-
 
 subset_cols= ["product_name"]
 df1 = apply_and_log(df1, df_lemmatize_columns_spacy , "lemma", subset_cols)
 # subset_cols= ["product_name"]
 # df1 = apply_and_log(df1, df_to_strip, "strip", subset_cols)
 
-
 # Display change summary
 change_df = pd.DataFrame(change_log).set_index("function").fillna(0).astype(int)
 print("\nChange Count Table:")
 print(change_df)
 
-
-# ----------------------------
-# Blocking
-# ----------------------------
-indexer = recordlinkage.Index()
-indexer.block('factory_country')
-
-candidate_links = indexer.index(df1)
-
-# ----------------------------
-# Compare
-# ----------------------------
-compare = recordlinkage.Compare()
-compare.exact('factory_country', 'factory_country', label='country')
-compare.exact('factory_city', 'factory_city', label='city')
-compare.string('factory_name', 'factory_name', label='name')
-
-
-compare.add(CompareAnyStringListMatch('product_name_lemma', 'product_name_lemma', threshold=0.80, method='jarowinkler', label='product'))
-compare.add(CompareAnyStringListMatch('owner_company_name', 'owner_company_name', threshold=0.80, method='jarowinkler', label='owner'))
-
-features = compare.compute(candidate_links, df1)
-
-# ----------------------------
-# Match Logic
-# ----------------------------
-matches = features[
-    (features['country'] == 1) &
-    (features['city'] == 1) &
-    (
-        (features['name'] == 1) |
-        (features['owner'] == 1) |
-        (features['product'] == 1)
-    )
-]
-
-match_pairs = matches.index.tolist()
-print("Matched Pairs:", match_pairs)
-
-
-# ----------------------------
-# Grouping
-# ----------------------------
-G = nx.Graph()
-G.add_edges_from(match_pairs)
-record_to_group = {record: group_id for group_id, component in enumerate(nx.connected_components(G)) for record in component}
-
-# ----------------------------
-# Annotate Output
-# ----------------------------
-df1['group_id'] = -1
-df1['is_duplicate'] = False
-
-for record_idx, group_id in record_to_group.items():
-    df1.at[record_idx, 'group_id'] = group_id
-    df1.at[record_idx, 'is_duplicate'] = True
-
-# ----------------------------
-# 8. Display Results
-# ----------------------------
-
-# Save to file if needed
-
-
-df1 = df1.rename(columns={"is_duplicate": "is_duplicate_step3", "group_id": "group_id_step3"})
-df1.to_excel("full_step3.xlsx", index=False)
-df6 = df1[df1['is_duplicate_step3'] == True].copy()
-df7 = df1[df1['is_duplicate_step3'] == False].copy()
-
-
-df6.to_excel("is_duplicate_step3.xlsx", index=False)
-df7.to_excel("is_not_duplicate_step3.xlsx", index=False)
-
-
 # Step 4 (geo)------------------------
 
-import pandas as pd
-import requests
-import time
-import pycountry
-
-# Your GeoNames username
 GEONAMES_USERNAME = "mjuge"
 
 def get_iso2_country_code(name):
@@ -458,7 +242,6 @@ def get_adm2_from_geonames(city, country=None):
         print(f"API error for city: {city}, country: {country} → {e}")
         return None, None, True
 
-
 def df_assign_adm2_to_city_column(df, city_col, country_col=None):
     print(f"\nProcessing ADM2 from '{city_col}'" + (f" with fallback country column '{country_col}'" if country_col else ""))
     df = df.copy()
@@ -511,30 +294,26 @@ def df_assign_adm2_to_city_column(df, city_col, country_col=None):
     return df
 
 # Apply the lemmatization function using spaCy
-
 df1 = df_assign_adm2_to_city_column(df1, city_col="factory_city", country_col="factory_country")
-# df1 = df1.drop(['factory_city_adm2name_flat'])
+#df1 = df1.drop(['factory_city_adm2name_flat'])
 
 # ----------------------------
-# Blocking
+# Blocking - we only allow comparison for entries that are in the same country
 # ----------------------------
 indexer = recordlinkage.Index()
 indexer.block('factory_country')
 
 candidate_links = indexer.index(df1)
 
-
-
 # ----------------------------
 # Compare
 # ----------------------------
-compare = recordlinkage.Compare()
-compare.exact('factory_country', 'factory_country', label='country')
+compare = recordlinkage.Compare() #initialises a comparison engine
+compare.exact('factory_country', 'factory_country', label='country') 
 compare.exact('factory_city', 'factory_city', label='city')
-compare.exact('factory_city_adm2name', 'factory_city_adm2name', label='adm2')
 compare.string('factory_name', 'factory_name', label='name')
 
-compare.add(CompareAnyStringListMatch('product_name_lemma', 'product_name_lemma', threshold=0.80, method='jarowinkler', label='product'))
+compare.add(CompareAnyStringListMatch('product_name', 'product_name', threshold=0.80, method='jarowinkler', label='product'))
 compare.add(CompareAnyStringListMatch('owner_company_name', 'owner_company_name', threshold=0.80, method='jarowinkler', label='owner'))
 
 features = compare.compute(candidate_links, df1)
@@ -544,10 +323,7 @@ features = compare.compute(candidate_links, df1)
 # ----------------------------
 matches = features[
     (features['country'] == 1) &
-    (
-        (features['city'] == 1) | 
-        (features['adm2'] == 1)
-    ) &
+    (features['city'] == 1) &
     (
         (features['name'] == 1) |
         (features['owner'] == 1) |
@@ -555,10 +331,8 @@ matches = features[
     )
 ]
 
-
 match_pairs = matches.index.tolist()
 print("Matched Pairs:", match_pairs)
-
 
 # ----------------------------
 # Grouping
@@ -578,21 +352,13 @@ for record_idx, group_id in record_to_group.items():
     df1.at[record_idx, 'is_duplicate'] = True
 
 # ----------------------------
-# 8. Display Results
+# Save Output
 # ----------------------------
+df1.to_excel("clean_output_ben_ben.xlsx", index=False)
 
-# Save to file if needed
+#df1 = df1.rename(columns={"is_duplicate": "is_duplicate_step1", "group_id": "group_id_step1"})
+#df1[df1['is_duplicate_step1']].to_excel("is_duplicate_step1.xlsx", index=False)
+#df1[~df1['is_duplicate_step1']].to_excel("is_not_duplicate_step1.xlsx", index=False)
 
-
-
-df1 = df1.rename(columns={"is_duplicate": "is_duplicate_step4", "group_id": "group_id_step4"})
-df1.to_excel("full_step4.xlsx", index=False)
-
-df8 = df1[df1['is_duplicate_step4'] == True].copy()
-df9 = df1[df1['is_duplicate_step4'] == False].copy()
-
-
-df8.to_excel("is_duplicate_step4.xlsx", index=False)
-df9.to_excel("is_not_duplicate_step4.xlsx", index=False)
-#Change print ---------------------------
-change_df.to_excel("changes.xlsx",index=True)
+# #Change print ---------------------------
+# change_df.to_excel("changes.xlsx",index=True)
