@@ -29,10 +29,11 @@ from src.functions import (
     df_expand_abbreviations,
     df_lemmatize_columns_spacy
 )
-from src.mongo import fetch_meta, fetch_nodes_and_rels
+#from src.mongo import fetch_meta, fetch_nodes_and_rels
 
 # ----------------------------
-# Custom list-string matcher
+# Custom list-string matcher - 
+# this compares two columns of lists of strings, and returns 1 if any string in one list sufficiently matches any string in the other list
 # ----------------------------
 class CompareAnyStringListMatch(BaseCompareFeature):
     def __init__(self, left_on, right_on=None, threshold=0.80, method='jarowinkler', label=None):
@@ -93,12 +94,14 @@ class CompareAnyStringListMatch(BaseCompareFeature):
 # ----------------------------
 # Load Data & Preprocess
 # ----------------------------
+
 file_path = "reconciliation_outputs_factory.xlsx"
 df1 = pd.read_excel(file_path, sheet_name="factory")
 subset_cols = ["factory_name", "factory_country", "factory_city", "owner_company_name", "product_name"]
 change_log = []
 
 def apply_and_log(df, func, func_name, subset_cols):
+    '''Collects meta information about how many changes are caused by each cleaning function'''
     df, counts = func(df.copy(), subset_cols)
     counts['function'] = func_name
     change_log.append(counts)
@@ -154,7 +157,7 @@ df1['owner_company_name'] = df1['owner_company_name'].astype(object)
 
 
 # ----------------------------
-# Blocking
+# Blocking - we only allow comparison for entries that are in the same country
 # ----------------------------
 indexer = recordlinkage.Index()
 indexer.block('factory_country')
@@ -164,8 +167,8 @@ candidate_links = indexer.index(df1)
 # ----------------------------
 # Compare
 # ----------------------------
-compare = recordlinkage.Compare()
-compare.exact('factory_country', 'factory_country', label='country')
+compare = recordlinkage.Compare() #initialises a comparison engine
+compare.exact('factory_country', 'factory_country', label='country') 
 compare.exact('factory_city', 'factory_city', label='city')
 compare.string('factory_name', 'factory_name', label='name')
 
