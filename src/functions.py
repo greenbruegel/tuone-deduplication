@@ -27,6 +27,7 @@ from openpyxl.styles import Font
 from copy import copy
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
+import recordlinkage
 
 
 import pandas as pd
@@ -177,7 +178,9 @@ def df_remove_diacritics(df, subset_cols):
 
 ## STEP2: more complex normalization 
 
-def df_remove_punctuation(df, subset_cols,):
+import re
+
+def df_remove_punctuation(df, subset_cols):
     pattern = r"[.,;!?]"
     change_counts = {col: 0 for col in subset_cols}
 
@@ -187,7 +190,7 @@ def df_remove_punctuation(df, subset_cols,):
         def clean_text(x):
             if isinstance(x, str):
                 cleaned = re.sub(pattern, '', x)
-                return cleaned, cleaned != x
+                return cleaned, int(cleaned != x)
 
             elif isinstance(x, list):
                 cleaned_items = []
@@ -200,15 +203,16 @@ def df_remove_punctuation(df, subset_cols,):
                         cleaned_items.append(cleaned_item)
                     else:
                         cleaned_items.append(item)
-                return ', '.join(cleaned_items), count
+                return cleaned_items, count  # ✅ return list, not string
 
-            return x, 0
+            return x, 0  # non-str, non-list: unchanged
 
         results = df[col].apply(clean_text)
         df[col] = results.apply(lambda x: x[0])
         change_counts[col] = results.apply(lambda x: x[1]).sum()
 
     return df, change_counts
+
 
 def df_replace_hyphen_with_space(df, subset_cols):
     change_counts = {col: 0 for col in subset_cols}
@@ -342,59 +346,61 @@ def df_group_by_scenario(df, scenario):
     return DB1.reset_index(drop=False), DB2.reset_index(drop=False)
 
 #Step 3-----------------------------
+import pandas as pd
 import ast
-from os.path import basename
+from cleanco import basename
 
 def df_clean_company(df, subset_cols):
-    change_counts = {col: 0 for col in subset_cols}
+    change_counts = {}
+
+    def clean_item(original):
+        if not isinstance(original, str):
+            return original, False
+        original_stripped = original.strip()
+        cleaned = basename(original_stripped)
+        changed = cleaned != original_stripped
+        return cleaned, changed
 
     def cleanco_func(x):
-        count = 0
-        if pd.isna(x):
-            return x, count
-        elif isinstance(x, str):
+        changes = 0
+        if isinstance(x, str):
+            # Try parsing as list-string
             try:
                 parsed = ast.literal_eval(x)
                 if isinstance(parsed, list):
                     cleaned_list = []
-                    for original in parsed:
-                        if isinstance(original, str):
-                            cleaned = basename(original.strip())
-                            if cleaned != original.strip():
-                                count += 1
-                                print(f"Original: {original.strip()!r} → Cleaned: {cleaned!r}")
-                            cleaned_list.append(cleaned)
-                        else:
-                            cleaned_list.append(original)
-                    return cleaned_list, count
+                    for item in parsed:
+                        cleaned, changed = clean_item(item)
+                        changes += int(changed)
+                        cleaned_list.append(cleaned)
+                    return cleaned_list, changes
             except (ValueError, SyntaxError):
-                original_stripped = x.strip()
-                cleaned = basename(original_stripped)
-                if cleaned != original_stripped:
-                    count += 1
-                    print(f"Original: {original_stripped!r} → Cleaned: {cleaned!r}")
-                return cleaned, count
-
+                # Not a list-string, treat as simple string
+                cleaned, changed = clean_item(x)
+                return cleaned, int(changed)
         elif isinstance(x, list):
             cleaned_list = []
-            for original in x:
-                if isinstance(original, str):
-                    cleaned = basename(original.strip())
-                    if cleaned != original.strip():
-                        count += 1
-                        print(f"Original: {original.strip()!r} → Cleaned: {cleaned!r}")
-                    cleaned_list.append(cleaned)
-                else:
-                    cleaned_list.append(original)
-            return cleaned_list, count
-
+            for item in x:
+                cleaned, changed = clean_item(item)
+                changes += int(changed)
+                cleaned_list.append(cleaned)
+            return cleaned_list, changes
+        elif isinstance(x, (float, int)) or pd.api.types.is_scalar(x):
+            if pd.isna(x):
+                return x, 0
+            return x, 0
         else:
-            return x, count
+            return x, 0
 
     for col in subset_cols:
-        results = df[col].apply(cleanco_func)
-        df[col] = results.apply(lambda x: x[0])
-        change_counts[col] = results.apply(lambda x: x[1]).sum()
+        total_changes = 0
+        cleaned_values = []
+        for val in df[col]:
+            cleaned_val, changes = cleanco_func(val)
+            total_changes += changes
+            cleaned_values.append(cleaned_val)
+        df[col] = cleaned_values
+        change_counts[col] = total_changes
 
     return df, change_counts
 
@@ -466,6 +472,58 @@ def df_expand_abbreviations(df, subset_cols):
 
     return df, change_counts
 
+
+import pandas as pd
+import spacy
+
+nlp = spacy.load("en_core_web_sm")
+
+def df_lemmatize_columns_spacy(df, subset_cols):
+    """
+    Applies spaCy lemmatization to each string in a list of phrases.
+    Converts each phrase into its lemmatized form (still as a phrase).
+    Returns a new column with the same list structure but lemmatized strings.
+    """
+    change_counts = {col: 0 for col in subset_cols}
+
+    def lemmatize_phrases(text):
+        # Case 1: list of phrases
+        if isinstance(text, list):
+            lemmatized_list = []
+            changed = 0
+            for phrase in text:
+                if isinstance(phrase, str):
+                    doc = nlp(phrase)
+                    lemmatized_phrase = " ".join([token.lemma_ for token in doc])
+                    if lemmatized_phrase != phrase:
+                        print(f"Lemmatized phrase: '{phrase}' → '{lemmatized_phrase}'")
+                        changed += 1
+                    lemmatized_list.append(lemmatized_phrase)
+                else:
+                    lemmatized_list.append(phrase)
+            return lemmatized_list, changed
+
+        # Case 2: single string
+        elif isinstance(text, str):
+            doc = nlp(text)
+            lemmatized_phrase = " ".join([token.lemma_ for token in doc])
+            if lemmatized_phrase != text:
+                print(f"Lemmatized string: '{text}' → '{lemmatized_phrase}'")
+                return [lemmatized_phrase], 1
+            return [lemmatized_phrase], 0
+
+        # Case 3: other types (leave unchanged)
+        return text, 0
+
+    for col in subset_cols:
+        print(f"\nProcessing column: '{col}'")
+        lemmatized_results = df[col].apply(lemmatize_phrases)
+        df[f"{col}_lemma"] = lemmatized_results.apply(lambda x: x[0])
+        change_counts[col] = lemmatized_results.apply(lambda x: x[1]).sum()
+
+    return df, change_counts
+
+    return df, change_counts
 
 
 #Step where we create xlsx ------------
@@ -672,4 +730,7 @@ def run_factory_centric_enrichment(df_all_nodes, df_all_rels, df_meta):
 
     print("\u2705 Saved factory-centric outputs to reconciliation_outputs_factory.xlsx")
     return df_master_final
+
+
+
 
