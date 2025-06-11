@@ -1,410 +1,170 @@
-import os
-import re
+import pandas as pd
+from src.step_1 import TextCleaner
+from src.step_2 import standardise_country_city
+import logging
 import sys
 from datetime import datetime
-from itertools import combinations
-from collections import defaultdict
-from copy import copy
-
-import pandas as pd
-import geopandas as gpd
-import networkx as nx
-from shapely.geometry import Point
-from geopy.geocoders import Nominatim
-from geopy.extra.rate_limiter import RateLimiter
-from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font
-from rapidfuzz import fuzz
-from neo4j import GraphDatabase
-from pymongo import MongoClient
-
-# Ensure access to project modules
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-
-# Import cleaning functions
-from src.functions import (
-    run_factory_centric_enrichment,
-    df_to_lower,
-    df_normalize_nfkd,
-    df_remove_diacritics,
-    df_to_strip,
-    df_remove_punctuation,
-    df_replace_hyphen_with_space,
-    df_expand_symbols,
-    df_group_by_scenario,
-    df_clean_company,
-    df_expand_abbreviations
-)
-from src.mongo import fetch_meta, fetch_nodes_and_rels
-
-# Load Excel
-file_path = "reconciliation_outputs_factory.xlsx"
-df1 = pd.read_excel(file_path, sheet_name="summary_view_factory")
-
-subset_cols = ["factory_name", "factory_country", "factory_city", "owner_company_name", "product_name"]
-
-change_log = []
-
-# -----------------------------
-# Preprocessing Count Functions
-# -----------------------------
-def apply_and_log(df, func, func_name, subset_cols):
-    df, counts = func(df.copy(), subset_cols)
-    counts['function'] = func_name
-    change_log.append(counts)
-    return df
-
-# Apply normalization steps with logging
-df1 = apply_and_log(df1, df_to_lower, "lower", subset_cols)
-df1 = apply_and_log(df1, df_remove_diacritics, "diacritics", subset_cols)
-df1 = apply_and_log(df1, df_normalize_nfkd, "nfkd", subset_cols)
-df1 = apply_and_log(df1, df_to_strip, "strip", subset_cols)
-
-# Show preview
-print(df1.head())
-
-# Display change summary
-change_df = pd.DataFrame(change_log).set_index("function").fillna(0).astype(int)
-print("\nChange Count Table:")
-print(change_df)
-
-import pandas as pd
+import time
+from tqdm import tqdm
+import ast
 import numpy as np
-import recordlinkage
-import networkx as nx
 
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(f'logs/pipeline_log_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
 
+# Start timing the entire pipeline
+t0_pipeline = time.time()
 
-# ----------------------------
-# 2. Normalize for Flat Comparison
-# ----------------------------
-def normalize(val):
-    if isinstance(val, list) and val:
-        return sorted(set(str(x).strip().lower() for x in val if str(x).strip()))
-    elif pd.notna(val):
-        return [str(val).strip().lower()]
-    else:
-        return []
-
-for col in ['factory_name', 'factory_country', 'factory_city', 'owner_company_name', 'product_name']:
-    df1[col] = df1[col].apply(normalize)
-
-# Flatten first element for blocking & string matching
-for col in ['factory_name', 'factory_country', 'factory_city', 'owner_company_name', 'product_name']:
-    df1[f'{col}_flat'] = df1[col].apply(lambda x: x[0] if x else '')
-
-# ----------------------------
-# 3. Blocking (on country + city)
-# ----------------------------
-indexer = recordlinkage.Index()
-indexer.block('factory_country_flat')
-
-candidate_links = indexer.index(df1)
-
-# ----------------------------
-# 4. Compare
-# ----------------------------
-compare = recordlinkage.Compare()
-compare.exact('factory_country_flat', 'factory_country_flat', label='country')
-compare.exact('factory_city_flat', 'factory_city_flat', label='city')
-compare.string('factory_name_flat', 'factory_name_flat', method='jarowinkler', threshold=0.90, label='name')
-compare.exact('owner_company_name_flat', 'owner_company_name_flat', label='owner')
-compare.string('product_name_flat', 'product_name_flat', method='jarowinkler', threshold=0.90, label='product')
-
-features = compare.compute(candidate_links, df1)
-
-# ----------------------------
-# 5. Matching Logic
-# ----------------------------
-matches = features[
-    (features['country'] == 1) &
-    (features['city'] == 1) &
-    (
-        (features['name'] == 1) |
-        (features['owner'] == 1) |
-        (features['product'] == 1)
-    )
+# Input file and columns to validate
+file_path = "./storage/input/reconciliation_outputs_factory.xlsx"
+subset_cols = [
+    "factory_country",
+    "factory_city",
+    "owner_company_name",
+    "product_name"
 ]
 
-match_pairs = matches.index.tolist()
-print("Matched Pairs:")
-print(match_pairs)
+# 1) Load and validate data
+logging.info(f"Reading input file: {file_path}")
+df = pd.read_excel(file_path, sheet_name="summary_view_factory")
+initial_len = len(df)
 
-# ----------------------------
-# 6. Grouping Matched Records
-# ----------------------------
-G = nx.Graph()
-G.add_edges_from(match_pairs)
+df = df.dropna(subset=subset_cols)
+logging.info(f"Dropped {initial_len - len(df)} rows; {len(df)} remain after validation")
 
-record_to_group = {}
-for group_id, component in enumerate(nx.connected_components(G)):
-    for record in component:
-        record_to_group[record] = group_id
+if df.empty:
+    logging.error("No valid rows remaining after validation. Exiting.")
+    sys.exit(1)
 
-print("\nRecord to Group Mapping:")
-print(record_to_group)
+# 2) Explode list columns
+list_cols = ["owner_company_name", "product_name"]
 
-# ----------------------------
-# 7. Annotate Output
-# ----------------------------
-df1['group_id'] = -1
-df1['is_duplicate'] = False
-
-for record_idx, group_id in record_to_group.items():
-    df1.at[record_idx, 'group_id'] = group_id
-    df1.at[record_idx, 'is_duplicate'] = True
-
-# ----------------------------
-# 8. Display Results
-# ----------------------------
-print("\nFinal Annotated Output:")
-print(df1[['factory_name_flat', 'product_name_flat', 'group_id', 'is_duplicate']])
-
-# Save to file if needed
-df1.to_excel("full_step1.xlsx", index=False)
-df1 = df1.rename(columns={"is_duplicate": "is_duplicate_step1", "group_id": "group_id_step1"})
-df2 = df1[df1['is_duplicate_step1'] == True].copy()
-df3 = df1[df1['is_duplicate_step1'] == False].copy()
-
-
-df2.to_excel("is_duplicate_step1.xlsx", index=False)
-df3.to_excel("is_not_duplicate_step1.xlsx", index=False)
-
-
-
-# Step 2 -------------------------------------------------------
-
-pattern = r"[.,;!?]"
-
-# Apply normalization steps with logging
-df1 = apply_and_log(df1, df_remove_punctuation , "ponctuation", subset_cols)
-df1 = apply_and_log(df1, df_replace_hyphen_with_space, "hyphen", subset_cols)
-df1 = apply_and_log(df1, df_expand_symbols, "symbol", subset_cols)
-
-# Show preview
-print(df1.head())
-
-# Display change summary
-change_df = pd.DataFrame(change_log).set_index("function").fillna(0).astype(int)
-print("\nChange Count Table:")
-print(change_df)
-
-
-
-# ----------------------------
-# 2. Normalize for Flat Comparison
-# ----------------------------
-def normalize(val):
-    if isinstance(val, list) and val:
-        return sorted(set(str(x).strip().lower() for x in val if str(x).strip()))
-    elif pd.notna(val):
-        return [str(val).strip().lower()]
-    else:
+def safe_eval_list(x):
+    if pd.isna(x):
         return []
+    if isinstance(x, list):
+        return x
+    if isinstance(x, str):
+        try:
+            s = x.strip()
+            if s.startswith('[') and s.endswith(']'):
+                return ast.literal_eval(s)
+            return [s]
+        except Exception:
+            return [x]
+    return [x]
 
-for col in ['factory_name', 'factory_country', 'factory_city', 'owner_company_name', 'product_name']:
-    df1[col] = df1[col].apply(normalize)
+for col in list_cols:
+    if col in df.columns:
+        df[col] = df[col].apply(safe_eval_list)
+        df = df.explode(col)
+        logging.info(f"Exploded column {col}")
 
-# Flatten first element for blocking & string matching
-for col in ['factory_name', 'factory_country', 'factory_city', 'owner_company_name', 'product_name']:
-    df1[f'{col}_flat'] = df1[col].apply(lambda x: x[0] if x else '')
+df.reset_index(drop=True, inplace=True)
+logging.info(f"DataFrame has {len(df)} rows after exploding lists")
 
-# ----------------------------
-# 3. Blocking (on country + city)
-# ----------------------------
-indexer = recordlinkage.Index()
-indexer.block('factory_country_flat')
-
-candidate_links = indexer.index(df1)
-
-# ----------------------------
-# 4. Compare
-# ----------------------------
-compare = recordlinkage.Compare()
-compare.exact('factory_country_flat', 'factory_country_flat', label='country')
-compare.exact('factory_city_flat', 'factory_city_flat', label='city')
-compare.string('factory_name_flat', 'factory_name_flat', method='jarowinkler', threshold=0.90, label='name')
-compare.exact('owner_company_name_flat', 'owner_company_name_flat', label='owner')
-compare.string('product_name_flat', 'product_name_flat', method='jarowinkler', threshold=0.90, label='product')
-
-features = compare.compute(candidate_links, df1)
-
-# ----------------------------
-# 5. Matching Logic
-# ----------------------------
-matches = features[
-    (features['country'] == 1) &
-    (features['city'] == 1) &
-    (
-        (features['name'] == 1) |
-        (features['owner'] == 1) |
-        (features['product'] == 1)
-    )
+# 3) Cleaning pipeline on raw data
+cleaner = TextCleaner()
+pipeline = [
+    (cleaner.to_lower, "lower"),
+    (cleaner.remove_diacritics, "diacritics"),
+    (cleaner.normalize_nfkd, "nfkd"),
+    (cleaner.strip, "strip"),
+    (cleaner.remove_punctuation, "punctuation"),
+    (cleaner.replace_hyphen_with_space, "hyphen"),
+    (cleaner.expand_symbols, "symbol")
 ]
+change_log = []
+for fn, label in pipeline:
+    logging.info(f"Starting pipeline step: {label}")
+    df, counts = fn(df, subset_cols)
+    change_log.append(counts)
+    changes = ", ".join(f"{c}:{cnt}" for c,cnt in counts.items() if cnt)
+    logging.info(f"Step {label} done. Changes: {changes or 'none'}")
 
-match_pairs = matches.index.tolist()
-print("Matched Pairs:")
-print(match_pairs)
+# 4) Deduplicate cleaned and standardize locations
+unique_loc = df[['factory_city', 'factory_country']].drop_duplicates().reset_index(drop=True)
+logging.info(f"Found {len(unique_loc)} unique city-country combinations to standardize")
 
-# ----------------------------
-# 6. Grouping Matched Records
-# ----------------------------
-G = nx.Graph()
-G.add_edges_from(match_pairs)
+# Estimate and log
+ess_sec = len(unique_loc)
+logging.info(f"Estimated time for geonames calls: {ess_sec//60}m {ess_sec%60}s")
 
-record_to_group = {}
-for group_id, component in enumerate(nx.connected_components(G)):
-    for record in component:
-        record_to_group[record] = group_id
+# Standardize locations
+start_loc = time.time()
+unique_loc = standardise_country_city(
+    unique_loc,
+    city_col="factory_city",
+    country_col="factory_country",
+    verbose=True,     # <- prints each lookup as it happens
+    details=False 
+)
+elapsed_loc = time.time() - start_loc
+logging.info(f"Location standardization took {elapsed_loc:.2f}s ({elapsed_loc/len(unique_loc):.2f}s per lookup)")
 
-print("\nRecord to Group Mapping:")
-print(record_to_group)
+# 5) Build mapping keyed by (city, country) and log mappings by (city, country) and log mappings
+unique_loc['_key'] = list(zip(unique_loc.factory_city, unique_loc.factory_country))
 
-# ----------------------------
-# 7. Annotate Output
-# ----------------------------
-df1['group_id'] = -1
-df1['is_duplicate'] = False
+maps = {}
+def build_and_log_map(col_name, series):
+    mp = dict(zip(unique_loc['_key'], series))
+    for k, v in mp.items():
+        logging.info(f"Mapping prepared for {col_name}: {k} -> {v}")
+    return mp
 
-for record_idx, group_id in record_to_group.items():
-    df1.at[record_idx, 'group_id'] = group_id
-    df1.at[record_idx, 'is_duplicate'] = True
+maps['country_standardized'] = build_and_log_map('country_standardized', unique_loc['country_standardized'])
+maps['country_iso2']        = build_and_log_map('country_iso2',        unique_loc['country_iso2'])
+maps['country_not_found']   = build_and_log_map('country_not_found',   unique_loc['country_not_found'])
+maps['factory_city_adm_name']  = build_and_log_map('factory_city_adm_name',  unique_loc['factory_city_adm_name'])
+maps['factory_city_adm_code']  = build_and_log_map('factory_city_adm_code',  unique_loc['factory_city_adm_code'])
+maps['factory_city_adm_level'] = build_and_log_map('factory_city_adm_level', unique_loc['factory_city_adm_level'])
+maps['factory_city_latitude']  = build_and_log_map('factory_city_latitude',  unique_loc['factory_city_latitude'])
+maps['factory_city_longitude'] = build_and_log_map('factory_city_longitude', unique_loc['factory_city_longitude'])
+maps['factory_city_not_found'] = build_and_log_map('factory_city_not_found', unique_loc['factory_city_not_found'])
 
-# ----------------------------
-# 8. Display Results
-# ----------------------------
-print("\nFinal Annotated Output:")
-print(df1[['factory_name_flat', 'product_name_flat', 'group_id', 'is_duplicate']])
+# 6) Apply mappings back to main df
+logging.info("Mapping standardized location data back to original DataFrame")
+df['_key'] = list(zip(df.factory_city, df.factory_country))
+for col, mp in maps.items():
+    df[col] = df['_key'].map(mp)
+df.drop(columns=['_key'], inplace=True)
 
-# Save to file if needed
-df1.to_excel("full_step1.xlsx", index=False)
-df1 = df1.rename(columns={"is_duplicate": "is_duplicate_step2", "group_id": "group_id_step2"})
-df4 = df1[df1['is_duplicate_step2'] == True].copy()
-df5 = df1[df1['is_duplicate_step2'] == False].copy()
+# 7) Compute clusters
+group_cols = ['country_standardized', 'factory_city_adm_name', 'owner_company_name', 'product_name']
+complete_mask = df[group_cols].notna().all(axis=1)
+df['cluster_num'] = np.nan 
+df['cluster_id']  = '000000'
+tmp = df.loc[complete_mask].copy()
+tmp['cluster_num'] = tmp.groupby(group_cols).ngroup() + 1
+sizes = tmp.groupby('cluster_num')['factory_city_adm_name'].transform('size')
 
+tmp['cluster_id'] = (
+    sizes.gt(1)                       # keep only clusters with ≥2 rows
+    .mul(tmp['cluster_num'])          # multiply to keep the number or 0
+    .astype(int)
+    .astype(str)
+    .str.zfill(6)                     # pad to six digits
+)
+df.loc[complete_mask, ['cluster_num', 'cluster_id']] = tmp[['cluster_num', 'cluster_id']]
 
-df4.to_excel("is_duplicate_step2.xlsx", index=False)
-df5.to_excel("is_not_duplicate_step2.xlsx", index=False)
+# 8) Save output
+output_cols = [col for col in [
+    'factory_unique_id','factory_name','factory_city','factory_city_adm_name',
+    'factory_country','country_standardized','country_iso2','country_not_found',
+    'owner_company_unique_id','owner_company_name','product_name','factory_city_adm_code',
+    'factory_city_adm_level','factory_city_latitude','factory_city_longitude','cluster_id'
+] if col in df.columns]
+output_file = "./storage/output/clean_output.xlsx"
+logging.info(f"Saving output to {output_file}")
+df[output_cols].to_excel(output_file, index=False)
 
-
-# STEP 3 ------------------------------------------------
-
-# # Company and product-specific cleaning
-subset_cols= ["owner_company_name"]
-# Apply normalization steps with logging
-df1 = apply_and_log(df1, df_clean_company , "cleanCompany", subset_cols)
-subset_cols= ["product_name"]
-df1 = apply_and_log(df1, df_expand_abbreviations, "productAbbrevation",["product_name"])
-
-
-# Show preview
-print(df1.head())
-
-# Display change summary
-change_df = pd.DataFrame(change_log).set_index("function").fillna(0).astype(int)
-print("\nChange Count Table:")
-print(change_df)
-
-
-
-# ----------------------------
-# 2. Normalize for Flat Comparison
-# ----------------------------
-subset_cols = ["factory_name", "factory_country", "factory_city", "owner_company_name", "product_name"]
-def normalize(val):
-    if isinstance(val, list) and val:
-        return sorted(set(str(x).strip().lower() for x in val if str(x).strip()))
-    elif pd.notna(val):
-        return [str(val).strip().lower()]
-    else:
-        return []
-
-for col in ['factory_name', 'factory_country', 'factory_city', 'owner_company_name', 'product_name']:
-    df1[col] = df1[col].apply(normalize)
-
-# Flatten first element for blocking & string matching
-for col in ['factory_name', 'factory_country', 'factory_city', 'owner_company_name', 'product_name']:
-    df1[f'{col}_flat'] = df1[col].apply(lambda x: x[0] if x else '')
-
-# ----------------------------
-# 3. Blocking (on country + city)
-# ----------------------------
-indexer = recordlinkage.Index()
-indexer.block('factory_country_flat')
-
-candidate_links = indexer.index(df1)
-
-# ----------------------------
-# 4. Compare
-# ----------------------------
-compare = recordlinkage.Compare()
-compare.exact('factory_country_flat', 'factory_country_flat', label='country')
-compare.exact('factory_city_flat', 'factory_city_flat', label='city')
-compare.string('factory_name_flat', 'factory_name_flat', method='jarowinkler', threshold=0.90, label='name')
-compare.exact('owner_company_name_flat', 'owner_company_name_flat', label='owner')
-compare.string('product_name_flat', 'product_name_flat', method='jarowinkler', threshold=0.90, label='product')
-
-features = compare.compute(candidate_links, df1)
-
-# ----------------------------
-# 5. Matching Logic
-# ----------------------------
-matches = features[
-    (features['country'] == 1) &
-    (features['city'] == 1) &
-    (
-        (features['name'] == 1) |
-        (features['owner'] == 1) |
-        (features['product'] == 1)
-    )
-]
-
-match_pairs = matches.index.tolist()
-print("Matched Pairs:")
-print(match_pairs)
-
-# ----------------------------
-# 6. Grouping Matched Records
-# ----------------------------
-G = nx.Graph()
-G.add_edges_from(match_pairs)
-
-record_to_group = {}
-for group_id, component in enumerate(nx.connected_components(G)):
-    for record in component:
-        record_to_group[record] = group_id
-
-print("\nRecord to Group Mapping:")
-print(record_to_group)
-
-# ----------------------------
-# 7. Annotate Output
-# ----------------------------
-df1['group_id'] = -1
-df1['is_duplicate'] = False
-
-for record_idx, group_id in record_to_group.items():
-    df1.at[record_idx, 'group_id'] = group_id
-    df1.at[record_idx, 'is_duplicate'] = True
-
-# ----------------------------
-# 8. Display Results
-# ----------------------------
-print("\nFinal Annotated Output:")
-print(df1[['factory_name_flat', 'product_name_flat', 'group_id', 'is_duplicate']])
-
-# Save to file if needed
-df1.to_excel("full_step1.xlsx", index=False)
-df1 = df1.rename(columns={"is_duplicate": "is_duplicate_step3", "group_id": "group_id_step3"})
-
-df6 = df1[df1['is_duplicate_step3'] == True].copy()
-df7 = df1[df1['is_duplicate_step3'] == False].copy()
-
-
-df6.to_excel("is_duplicate_step3.xlsx", index=False)
-df7.to_excel("is_not_duplicate_step3.xlsx", index=False)
-
-df1 = df1.drop(columns=["is_duplicate", "group_id"])
-
-
-# Step 4 (geo)------------------------
+# Final timing
+t1_pipeline = time.time()
+logging.info(f"Total pipeline time: {(t1_pipeline - t0_pipeline)/60:.2f} minutes")
